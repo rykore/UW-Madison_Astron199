@@ -1,0 +1,30 @@
+!---------  grid_parameters ------------
+  rmin                                   =  0.1
+  rmax                                   =  300
+  zmax                                   =  150
+  ncol                                   =  300
+  dist                                   =  155.
+  incl                                   =  38.7
+  pa                                     =  37.6
+! -------- stellar_parameters ------------
+  star_mass_in_Msun                      =  0.46 
+  star_radius_in_Rsun                    =  1.458
+  star_temperature                       =  3631.
+  Lx                                     =  4e29
+! -----------  gas parameters ------------
+  mgas                                   = 1.e-3
+  rc_g                                   = 150. 
+  gamma_g                                = 1.0 
+  psi                                    = 1.15
+  r_ref                                  = 100.
+  h_ratio                                = 0.2
+  h_ref                                  = 10.   
+! --------    dust parameters ------------
+  rc_d1                                  = 100.
+  gamma_d1                               = 1.
+  fname_d1                               = ''
+  rout_d1                                = 100. 
+  mlarge_dust                            = 1e-3
+  msmall_dust                            = 1e-5  
+! --------    output dir parameters ------------
+  outputdir                              = 'storage/test/hd163296_chemistry/' 

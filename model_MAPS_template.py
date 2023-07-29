@@ -1,0 +1,686 @@
+"""Generic protoplanetary disk model 
+
+The density is given by 
+
+    .. math::
+        
+        \\rho = \\frac{\\Sigma(r,\\phi)}{H_p\\sqrt{(2\\pi)}} \\exp{\\left(-\\frac{z^2}{2H_p^2}\\right)}
+
+
+    * :math:`\Sigma` - surface density
+    * :math:`H_{\\rm p}` - Pressure scale height
+
+The molecular abundance function takes into account dissociation and freeze-out of the molecules
+For photodissociation only the continuum (dust) shielding is taken into account in a way that
+whenever the continuum optical depth radially drops below a threshold value the molecular abundance
+is dropped to zero. For freeze-out the molecular abundance below a threshold temperature is decreased
+by a given fractor. 
+
+
+"""
+
+import numpy as np
+import radmc3dPy as r3d
+from radmc3dPy.natconst import *
+import matplotlib.pylab as plb
+import radmc3dPy.analyze as analyze
+import sys
+import copy
+from scipy.integrate import simps
+from scipy.interpolate import interp1d
+import matplotlib.pyplot as plt
+
+# ===========================================================================
+
+def getModelDesc():
+    """Returns the brief description of the model.
+    """
+
+    return "disk model"
+           
+
+# =============================================================================
+#
+def getDefaultParams():
+    """Function to provide default parameter values of the model.
+
+    Returns a list whose elements are also lists with three elements:
+    1) parameter name, 2) parameter value, 3) parameter description
+    All three elements should be strings. The string of the parameter
+    value will be directly written out to the parameter file if requested,
+    and the value of the string expression will be evaluated and be put
+    to radmc3dData.ppar. The third element contains the description of the
+    parameter which will be written in the comment field of the line when
+    a parameter file is written. 
+    """
+
+    defpar = {}
+
+    defpar = [ 
+    ['mstar','[2.0*ms]','stellar mass'],
+    ['rstar','[1.582*rs]','radius of the star'], #assume L=17Lsun
+    ['tstar','[9332]','Teff '],
+    ['staremis_type','["kurucz"]', 'stellar emission type'],    
+    #['stellar_spectrum','""','stellar spectrum file'],
+    ['xres_nlev', '3', 'Number of refinement levels'],
+    ['xres_nspan', '3', 'Number of the original grid cells to refine'],
+    ['xres_nstep', '3', 'Number of grid cells to create in a refinement level'],
+    ['nx', '[400]', 'Number of grid points in the first dimension'],
+    ['xbound', '[0.45*au,650.0*au]', 'Number of radial grid points'],
+    ['ny', '[40,40]', 'Number of grid points in the first dimension'],
+    ['ybound', '[pi/3., pi/2., 2.*pi/3.]', 'Number of radial grid points'],
+    ['nz', '0', 'Number of grid points in the third dimension'],
+    ['zbound', '[0., 2.0*pi]', 'Number of radial grid points'],
+    ['nds','2','number of dust species'],
+    ['ngs','3','number of gas species'], 
+    ['nphot' ,'4000000', ' Nr of photons for the thermal Monte Carlo'] ,     
+    ['tgas_eq_tdust','0','use different temperatures for gas and dust'], 
+    #['writeimage_unformatted','1','use image.bout'],
+    ['scattering_mode_max','0','use g for scattering'],    
+    ['dustkappa_ext','["lg_maps_std","sm_maps_std"]','dust kappa file names'],
+    ['gdens','[1.68,2.4]','Bulk density of the materials in g/cm^3'],
+    #['gasspec_mol_name', "['13c18o','c18o','c17o']", ''],
+    ['gasspec_mol_name', "['c18o','13co','co']", ''],    
+    ['rac2d_mol_abun_scale', "[1./570,1./69,1.]", ''],
+    ['gasspec_mol_dbase_type', "['leiden','leiden','leiden']", ''],
+    ['gasspec_mol_abun', "[1e-4,1e-4,1e-4]", 'Not used here, use rac2d output results'], 
+    ['co_dissociation_column','1e21','CO photodissociation limit'],
+    ['co_freeze_temp','20.','CO freezeout temperature'],    
+    #    ['gasspec_mol_dissoc_taulim', '[1.0,1.0]', 'Continuum optical depth limit below which all molecules dissociate'],
+    # ['gasspec_mol_freezeout_temp', '[19.0]', 'Freeze-out temperature of the molecules in Kelvin'],
+    # ['gasspec_mol_freezeout_dfact', '[1e-3]', 'Factor by which the molecular abundance should be decreased in the frezze-out zone'],
+    ['gasspec_vturb', '2.83e4', 'Microturbulent line width'],
+    ['rin', '0.1*au', ' Inner radius of the disk'], # Kwon11
+    #['rdisk', '650.*au', ' Outer radius of the disk'],
+    ['hr_ref', '[0.08*0.2,0.08]', ' Ratio of the pressure scale height over radius at hrpivot'], 
+    ['r_ref', "100.*au", ' Reference radius at which Hp/R is taken'],
+    ['plh', '[0.08,0.08]', ' Flaring index'],    
+    ['h_wall','[0.*au,0.0*au]','puff-up wall'],
+    ['r_c', '[90.*au,165.*au]','characteristic radius'], 
+    ['gamma', '[0.1,0.8]', ' Power exponent of the surface density distribution as a function of radius'],
+    ['sigma_c', '[0.,0.]', ' Surface density at r_c'],
+    ['mdisk', '[1.2e-3,1.2e-3*0.25]', ' Mass of the dust disk in Msun (either sigma_c or mdisk should be set to zero or commented out)'],
+    ['bgdens', '1e-35', ' Background density (g/cm^3)'],
+    ['delta_r','[0.1*au,0.1*au]','Characteristic radial length for the puffed-up rim'],
+    ['r_dust_cav', '[.1*au,0.1*au]', ' Inner radius of the gap'],
+    ['log_delta', '[0.0,0.0]', ' Density reduction factor in the gap'],
+    ['tgas_file',  '"rac2d_input/Tgas.binp"','tgas input file'],
+    ['mole_abundance_file','["rac2d_input/X_CO.binp","rac2d_input/X_CO.binp","rac2d_input/X_CO.binp"]','abundace profile'],
+    ['modify_tgas_file','""','modify tgas based on tdust, input file'],
+    ['gas_numberdens_file','"rac2d_input/numberdens_H.binp"',"gas number density file"],
+    ['gas_surface_density_file','""',"gas surface density file"],
+    ['sigma_dust_file','["",""]','']]
+
+
+
+    return defpar
+
+# ========================================================================
+#
+# ========================================================================
+def update_grid(grid):
+    """ add zz, rcyl into grid"""
+    rr,th = np.meshgrid(grid.x,grid.y,indexing='ij')
+    zz    = rr*np.cos(th)
+    rcyl  = rr*np.sin(th)
+
+    grid.zz = zz
+    grid.rcyl = rcyl 
+
+    return grid 
+
+
+
+def get_surface_density_self_similar_disk(rcyl,r_c=1.,gamma=1.,sigma_c=0.,md=0.):
+    """self-similar solution of disk surface density
+       formula from Andrews et al. 2011
+    OUTPUT:
+    ------
+        return a surface density profile
+        if sigma_c == 0, will use md for normalization later"""
+
+    if sigma_c == 0:
+        sigma_c = 1.
+        
+    exp_factor = -1.*(rcyl/r_c)**(2.-gamma)
+    sigma_2d = sigma_c*(rcyl/r_c)**(-1.*gamma)*np.exp(exp_factor)
+
+    
+    if md > 0: # for given disk mass
+        rmin = rcyl.min() #AU
+        rmax = rcyl.max()
+
+
+        r_1d = np.linspace(rmin,rmax,2000)
+        exp_factor = -1.*(r_1d/r_c)**(2.-gamma)
+        sigma_1d = sigma_c*(r_1d/r_c)**(-1.*gamma)*np.exp(exp_factor)
+
+        print('dust disk mass=%.2e Msun'  %(md))
+        
+        md_scale = md*ms/(simps(sigma_1d*2.*np.pi*r_1d,r_1d))
+        print('md_scale=',md_scale)
+        
+        sigma_2d = sigma_2d*md_scale
+        
+                 
+    return sigma_2d
+
+
+def modify_sigma_gap(sigma_2d,rcyl,rin=1.,rout=1.,log_delta=1.):
+    
+    #sigma_2d     = copy.copy(sigma_2d_0)
+    ind          = (rcyl >= rin) & (rcyl<=rout)
+
+    sigma_2d[ind] = sigma_2d[ind]*10.**log_delta
+
+    return sigma_2d
+    
+
+    
+def get_power_law_scale_height(rcyl,hr_ref=1.,r_ref=1.,powerindex=1.):
+    """ calculate scale height as a function of radius"""
+    hp_2d= hr_ref* (rcyl/r_ref)**powerindex * rcyl
+    #print 'hr_ref=',hr_ref,'powerindex=',powerindex
+    
+    return hp_2d
+
+    
+def set_puff_up_wall_hp(rcyl,hp_2d_0,r_cav =1.,delta_r=1.,h_wall =1.):
+    """ Model puffed-up wall and exponentially join the global scale with a characteristic radius of delta_r"""
+
+    #hp_2d        = copy.copy(hp_2d_0)
+    r_max_modify = r_cav+10.*delta_r
+    ind          = (rcyl >= r_cav) & (rcyl<=r_max_modify) 
+    diff_hp      = h_wall - hp_2d_0[ind]
+    hp_2d_0[ind]   = hp_2d_0[ind]+diff_hp*np.exp(-1.*(rcyl[ind]-r_cav)/delta_r)
+
+    return hp_2d_0
+    
+
+
+def get_2d_scale_height(rcyl,ppar=1.,s_ind=0):
+    """ calculate scale height as a function of radius"""
+
+    hr_ref = ppar['hr_ref'][s_ind]
+    r_ref  = ppar['r_ref']
+    powerindex = ppar['plh'][s_ind]
+
+    r_cav  = ppar['r_dust_cav'][s_ind]
+    delta_r = ppar['delta_r'][s_ind]
+    h_wall  = ppar['h_wall'][s_ind]
+    hp_2d_global = get_power_law_scale_height(rcyl,hr_ref=hr_ref,r_ref=r_ref,powerindex=powerindex)
+
+    if h_wall>0.:
+        hp_2d        = set_puff_up_wall_hp(rcyl,hp_2d_global,r_cav=r_cav,delta_r=delta_r,h_wall=h_wall)
+        
+        return hp_2d
+    else:
+        return hp_2d_global
+
+
+def get_2d_sigma(rcyl,ppar=1.,s_ind=0):
+    """s_ind: dust species index"""
+
+    if ppar['sigma_dust_file'][s_ind]!='':
+        sigma_2d = _get_sigma_2d_from_file(ppar['sigma_dust_file'][s_ind],rcyl)
+
+    else:
+        r_c     = ppar['r_c'][s_ind]
+        gamma   = ppar['gamma'][s_ind]
+        sigma_c = ppar['sigma_c'][s_ind]
+    #md      = ppar['mdisk'][s_ind]
+    
+    
+        sigma_2d = get_surface_density_self_similar_disk(rcyl,r_c=r_c,gamma=gamma,sigma_c=sigma_c,md=0.)
+    
+    #outer edge
+        if 'outer_edge_para' in list(ppar.keys()):
+            r0= ppar['outer_edge_para'][s_ind][0]
+
+            if r0>0.:
+        
+                s0 = ppar['outer_edge_para'][s_ind][1]
+                ind = rcyl>r0
+                factor = (rcyl[ind]-r0)/s0
+
+                sigma_2d[ind] = sigma_2d[ind]*np.exp(-0.5*factor*factor)
+    
+    
+        rin     = ppar['rin']
+        rout    = ppar['r_dust_cav'][s_ind]
+        log_delta = ppar['log_delta'][s_ind]
+
+        if (rout>rin):
+           sigma_2d   = modify_sigma_gap(sigma_2d,rcyl,rin=rin,rout=rout,log_delta=log_delta)
+
+    return sigma_2d
+
+
+
+                        
+
+
+def _get_sigma_2d_from_file(fname,rcyl):
+    """ make sigma profile from a file"""
+    print('using ',fname)
+    data = np.loadtxt(fname,usecols=(0,1),delimiter=' ') #au,sigma(g/cm^2)
+    f = interp1d(data[:,0],data[:,1],fill_value='extrapolate')
+    
+    sigma_2d = np.zeros(rcyl.shape)
+
+    nr,nz = rcyl.shape
+
+    #print rcyl.shape,rcyl.max()/1.5e13
+    
+    for iz in range(nz):
+        sigma_2d[:,iz] = f(rcyl[:,iz]/1.5e13)
+
+    #plt.loglog(rcyl[:,iz]/1.5e13,sigma_2d[:,iz])
+    #plt.show()
+
+    return sigma_2d
+                                    
+
+    
+
+    
+def normalizeRho(mdisk,rho=1.,grid=1.):
+    """normaliz rho based on total disk mass"""
+    vol  = grid.getCellVolume()
+    mass = (rho*vol).sum(0).sum(0).sum(0)
+    rho  = rho * (mdisk/mass)
+
+    return rho
+
+
+
+
+
+
+def cum_colume_density(data,rho_h2):
+    """calculate column density from the cell to surface"""
+
+    # column density in spherical coordinates, theta angle
+    vol  = data.grid.getCellVolume()
+   # Total number of molecules / gas mass in each grid cell
+    mass = vol * rho_h2
+   # Calculate the surface of each grid facet in the midplane
+    surf     = np.zeros([data.grid.nx, data.grid.nz], dtype=np.float64)
+    diff_r2  = (data.grid.xi[1:]**2 - data.grid.xi[:-1]**2) * 0.5
+    diff_phi = data.grid.zi[1:] - data.grid.zi[:-1]  
+    for ix in range(data.grid.nx):
+       surf[ix,:] = diff_r2[ix] * diff_phi
+    nx = data.grid.nx    
+    ny = data.grid.ny
+    cum_mass = np.zeros([nx,ny])
+
+    cum_mass[:,0:ny/2] = np.cumsum(mass[:,0:ny/2,0],axis=1)
+    cum_mass[:,ny-1:ny/2-1:-1] = np.cumsum(mass[:,ny-1:ny/2-1:-1,0],axis=1)
+
+
+    Ngas = cum_mass/surf[:,0,np.newaxis]
+
+    return Ngas
+                                         
+
+
+
+
+
+#
+
+
+    
+
+    
+def normalizeRho(mdisk,rho=1.,grid=1.):
+    """normaliz rho based on total disk mass"""
+    vol  = grid.getCellVolume()
+    mass = (rho*vol).sum(0).sum(0).sum(0)
+    rho  = rho * (mdisk/mass)
+
+    return rho
+
+
+
+
+
+
+def cum_colume_density(data,rho_h2):
+    """calculate column density from the cell to surface"""
+
+    # column density in spherical coordinates, theta angle
+    vol  = data.grid.getCellVolume()
+   # Total number of molecules / gas mass in each grid cell
+    mass = vol * rho_h2
+   # Calculate the surface of each grid facet in the midplane
+    surf     = np.zeros([data.grid.nx, data.grid.nz], dtype=np.float64)
+    diff_r2  = (data.grid.xi[1:]**2 - data.grid.xi[:-1]**2) * 0.5
+    diff_phi = data.grid.zi[1:] - data.grid.zi[:-1]  
+    for ix in range(data.grid.nx):
+       surf[ix,:] = diff_r2[ix] * diff_phi
+    nx = data.grid.nx    
+    ny = data.grid.ny
+    cum_mass = np.zeros([nx,ny])
+
+    cum_mass[:,0:ny/2] = np.cumsum(mass[:,0:ny/2,0],axis=1)
+    cum_mass[:,ny-1:ny/2-1:-1] = np.cumsum(mass[:,ny-1:ny/2-1:-1,0],axis=1)
+
+
+    Ngas = cum_mass/surf[:,0,np.newaxis]
+
+    return Ngas
+                                         
+
+
+
+
+
+#
+
+    
+def normalizeRho(mdisk,rho=1.,grid=1.):
+    """normaliz rho based on total disk mass"""
+    vol  = grid.getCellVolume()
+    mass = (rho*vol).sum(0).sum(0).sum(0)
+    rho  = rho * (mdisk/mass)
+
+    return rho
+
+
+
+
+# ==============================================================
+#
+# ==============================================================
+
+def getDustDensity(grid=1., ppar=1.):
+    """Calculates the dust density distribution in a protoplanetary disk.
+   
+    Parameters
+    ----------
+    grid : radmc3dGrid
+           An instance of the radmc3dGrid class containing the spatial and frequency/wavelength grid
+    
+    ppar : dictionary
+           A dictionary containing all parameters of the model
+    
+    Returns
+    -------
+    Returns the volume density in g/cm^3
+    """
+
+    rr,th = np.meshgrid(grid.x,grid.y,indexing='ij')
+    zz    = rr*np.cos(th)
+    rcyl  = rr*np.sin(th)
+    vol   = grid.getCellVolume()
+
+    nds           = ppar['nds']
+    rho           = np.zeros((grid.nx,grid.ny,grid.nz,nds))
+
+    # prepare sigma and scale height
+    factor        = np.sqrt(2.0*np.pi)
+
+
+    for ids in range(nds):
+        hp        = get_2d_scale_height(rcyl,ppar=ppar,s_ind=ids)
+        #print hp.max(),hp.min()
+        # if ids ==0:
+        #     ind = rcyl <=ppar['r_dust_cav'][0] #large grain scale height emhancement, Cleeves 2016
+        #     hp[ind] = hp[ind]*4.
+
+        sigma_2d  = get_2d_sigma(rcyl,ppar=ppar,s_ind=ids)
+        dum       = sigma_2d/hp/factor*np.exp(-0.5*zz*zz/hp/hp)
+        dum[dum<=ppar['bgdens']] =ppar['bgdens']
+        rho[:,:,0,ids] = dum
+
+        for iz in range(grid.nz-1):
+            rho[:,:,iz+1,ids]  = rho[:,:,0,ids]
+
+        
+        if ppar['sigma_dust_file'][ids]=='':
+            # if not using an input file as surface density, rescale the dust file to match with md 
+            md      = ppar['mdisk'][ids]
+            scale_factor =  md*ms/(vol*rho[:,:,:,ids]).sum()
+            print('md=',md)
+            print('species_id=',ids,'scale_factor=',scale_factor)
+            rho[:,:,:,ids] = rho[:,:,:,ids]*scale_factor
+
+
+
+    return rho
+            
+ 
+# ==============================================================
+def getGasDensity(grid=None, ppar=None):
+    """Calculates the gas density distribution in a protoplanetary disk.
+    
+    Returns
+    -------
+    Returns the volume density in g/cm^3
+    """
+    data = r3d.analyze.radmc3dData()
+    data.grid = grid
+    print(ppar['gas_numberdens_file'])
+    if ppar['gas_numberdens_file']!='':
+        data.readGasTemp(fname=ppar['gas_numberdens_file'],binary=True,verbose=False)
+        n_gas = data.gastemp[:,:,:,0]
+        rho_h2 = n_gas*mp*2.4
+
+
+    else:
+        if ppar['gas_surface_density_file']!='':
+            """for a given surface density profile"""
+            grid = update_grid(grid)
+            rcyl = grid.rcyl
+            zz   = grid.zz
+            small_dust_pop_id = 1
+
+            sigma_2d = _get_sigma_2d_from_file(ppar['gas_surface_density_file'],rcyl) 
+            hp        = get_2d_scale_height(rcyl,ppar=ppar,s_ind=small_dust_pop_id) #assuming gas and small dust are co-spatial
+            dum       = sigma_2d/hp/(np.sqrt(2.0*np.pi))*np.exp(-0.5*zz*zz/hp/hp)
+            dum[dum<=ppar['bgdens']] =ppar['bgdens']
+            rho_h2_2d = dum
+
+            fig = plt.figure()
+            plt.loglog(rcyl[:,0]/au,sigma_2d[:,0])
+            fig.savefig('gas_surface_density.png')
+
+            rho_h2 = np.zeros((grid.nx,grid.ny,grid.nz))
+            for i in range(grid.nz):
+                rho_h2[:,:,i] = rho_h2_2d
+        else:
+            rho = getDustDensity(grid=grid,ppar=ppar)
+            md = np.array(ppar['mdisk'])
+            mdust_sum = md.sum()
+            rho_h2 = rho[:,:,:,1]*mdust_sum/md[1]*100. #assume g2d = 100.
+        
+
+    #print 'gas_density',n_h2.max(),n_h2.min()
+    return rho_h2
+
+
+def getGasAbundance(grid=None,ppar=None,ispec=''):
+    data = r3d.analyze.radmc3dData()
+    data.grid = grid
+    nz = grid.nz
+    
+    
+            
+    ids   = ppar['gasspec_mol_name'].index(ispec)
+
+    if ppar['mole_abundance_file'][ids]!='':
+        data.readGasTemp(fname=ppar['mole_abundance_file'][ids],binary=True,verbose=False)
+        factor_2d = data.gastemp[:,:,:,0]*ppar['rac2d_mol_abun_scale'][ids]
+
+        rr,th = np.meshgrid(grid.x,grid.y,indexing='ij')
+        zz    = rr*np.cos(th)
+        rcyl  = rr*np.sin(th)
+        rcyl_au = rcyl/au
+        zz_au   = zz/au
+
+        zmax = zz_au.max()
+        rmax = rcyl_au.max()
+
+        cmap = 'Spectral_r'
+        fig = plt.figure()
+        plt.contourf(rcyl_au,zz_au,factor_2d[:,:,0],\
+                 cmap=cmap)
+    
+        plt.colorbar()
+        fig.savefig('abundance_'+str(ids)+'.png')
+
+        #print(data.gastemp.shape)
+        
+        return factor_2d
+    else:
+        data.readDustDens(binary=True)
+        # CO warm molecular layer
+        rho_h2 = getGasDensity(grid=grid,ppar=ppar)
+        data.readDustTemp('dust_temperature.bdat')
+
+        n_h2 = rho_h2/(mp*2.4)
+        Ngas =cum_colume_density(data,n_h2)
+        
+        ind = Ngas<ppar['co_dissociation_column']
+        factor_2d = np.zeros((grid.nx,grid.ny))+1
+        factor_2d[ind] = 1e-3
+
+        dusttemp_1 = np.average(data.dusttemp[:,:,:,1],axis=2) # small dust
+        ind2 = dusttemp_1<=ppar['co_freeze_temp']
+        factor_2d[ind2]= 1e-4
+
+  
+    rr,th = np.meshgrid(grid.x,grid.y,indexing='ij')
+    zz    = rr*np.cos(th)
+    rcyl  = rr*np.sin(th)
+    rcyl_au = rcyl/au
+    zz_au   = zz/au
+
+    zmax = zz_au.max()
+    rmax = rcyl_au.max()
+
+    # ind = (rcyl_au>=70.) & (rcyl_au<=100.)
+    # factor_2d[ind]= factor_2d[ind]*10.
+
+    factor =  np.zeros((grid.nx,grid.ny,grid.nz))
+    for iz in range(grid.nz):
+        factor[:,:,iz] = factor_2d
+        
+
+    cmap = 'Spectral_r'
+    fig = plt.figure()
+    plt.contourf(rcyl_au,zz_au,factor[:,:,0],\
+                 cmap=cmap)
+    #plt.contourf(rcyl_au,zz_au,rho_h2[:,:,0]/data.rhodust[:,:,0,1],\
+    #             cmap=cmap) 
+    plt.colorbar()
+    fig.savefig('abundance.png')
+        
+    #tgas = data.gastemp[:,:,:,0]
+    #print 'abundance range=',tgas.max(),tgas.min()
+
+    
+
+    return factor*ppar['rac2d_mol_abun_scale'][ids]*2e-5 #CO
+            
+    #
+# ==========================================================================
+
+def getGasTemperature(grid,ppar):
+
+    print('making Tgas')
+    
+    data = r3d.analyze.radmc3dData()
+    data.grid = grid
+    ngs = ppar['ngs']
+    tgas  = np.zeros((grid.nx,grid.ny,grid.nz,ngs))
+
+    if ppar['tgas_file']!=None:
+        print(('reading tgas from '+ppar['tgas_file']))
+        data.readGasTemp(fname=ppar['tgas_file'],binary=True,verbose=False)
+    
+        for igs in range(ngs):
+            tgas[:,:,:,igs] = data.gastemp[:,:,:,0]
+
+    # minimum Tgas
+    ind = [tgas<3.]
+    tgas[tuple(ind)] = 3.
+        
+    return tgas
+
+#
+# =================================================================
+def getVTurb(grid=None, ppar=None):
+    """Calculates the turbulent velocity field
+    
+    Returns
+    -------
+    Returns an ndarray with the turbulent velocity in cm/s
+    """
+    print(('micro-turbulence =',ppar['gasspec_vturb']))
+    vturb = np.zeros([grid.nx, grid.ny, grid.nz], dtype=np.float64) + ppar['gasspec_vturb']
+    return vturb
+# =====================================================================
+#
+
+def getVelocity(grid=None, ppar=None):
+    """Calculates the velocity field in a protoplanetary disk.
+    
+    Returns
+    -------
+    Returns the gas velocity in cm/s
+    """
+
+   
+    nr       = grid.nx
+    nphi     = grid.nz
+    ntheta   = grid.ny
+    r        = grid.x
+
+    rr, th = np.meshgrid(grid.x, grid.y, indexing='ij')
+    #rcyl_rot = rr * np.sin(th)
+    
+    vel = np.zeros([nr,ntheta,nphi,3], dtype=np.float64)
+    vkep = np.sqrt(gg*ppar['mstar'][0]/rr)
+    vproj = vkep*np.sin(th)
+
+    
+    for ip in range(nphi):
+        vel[:,:,ip,2] = vproj
+
+
+    return vel
+
+
+def cum_colume_density(data,rho_h2):
+    """calculate column density from the cell to surface"""
+
+    # column density in spherical coordinates, theta angle
+    vol  = data.grid.getCellVolume()
+   # Total number of molecules / gas mass in each grid cell
+    mass = vol * rho_h2
+   # Calculate the surface of each grid facet in the midplane
+    surf     = np.zeros([data.grid.nx, data.grid.nz], dtype=np.float64)
+    diff_r2  = (data.grid.xi[1:]**2 - data.grid.xi[:-1]**2) * 0.5
+    diff_phi = data.grid.zi[1:] - data.grid.zi[:-1]  
+    for ix in range(data.grid.nx):
+       surf[ix,:] = diff_r2[ix] * diff_phi
+    nx = data.grid.nx    
+    ny = data.grid.ny
+    cum_mass = np.zeros([nx,ny])
+
+    cum_mass[:,0:ny/2] = np.cumsum(mass[:,0:ny/2,0],axis=1)
+    cum_mass[:,ny-1:ny/2-1:-1] = np.cumsum(mass[:,ny-1:ny/2-1:-1,0],axis=1)
+
+
+    Ngas = cum_mass/surf[:,0,np.newaxis]
+
+    return Ngas
+                                         
+
+
+
+#def get_sigma_2d_from_file(filename,rcyl):
+                                         
+                                         
